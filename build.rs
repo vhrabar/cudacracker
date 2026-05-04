@@ -47,7 +47,7 @@ fn main() {
     }
 
     build
-        .file("src/gpu_code/md5.cu")
+        .file("src/cuda/md5.cu")
         .compile("libcudacracker.a");
 
     let lib64 = Path::new(&cuda_home).join("lib64");
