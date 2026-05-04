@@ -1,0 +1,10 @@
+# IDE files
+.idea/
+.vscode/
+
+# OS Files
+.DS_Store
+
+# rust
+target/
+Cargo.lock
