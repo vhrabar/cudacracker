@@ -1,11 +1,15 @@
 [package]
 name = "cudacracker"
-version = "0.1.0"
-edition = "2021"
+version = "0.1.1"
+edition = "2024"
+license-file = "LICENSE"
+repository = "https://github.com/vhrabar/cudacracker"
+readme = "README.md"
+build = "build.rs"
 
 [dependencies]
-cc = "1.2.5"
-hex = "0.4.3"
+cc = "1.2"
+hex = "0.4"
 
 [build-dependencies]
-cc = "1.0"
+cc = "1.2"
