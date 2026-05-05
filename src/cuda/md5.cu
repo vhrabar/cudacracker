@@ -1,4 +1,10 @@
 #include <stdio.h>
+#include <cuda_runtime.h>
+#include <limits.h>
+
+#ifndef SIZE_MAX
+#define SIZE_MAX ((size_t)-1)
+#endif
 
 #define A0 (0x67452301)
 #define B0 (0xefcdab89)
@@ -8,7 +14,7 @@
 #define CHUNK_SIZE (64)
 #define WORD_SIZE (4)
 // How many MD5 hashes do we want to compute concurrently?
-#define BATCH_SIZE (4096)
+#define BATCH_SIZE (16384)
 #define CEIL(x) ((x) == (int)(x) ? (int)(x) : ((x) > 0 ? (int)(x) + 1 : (int)(x)))
 
 typedef unsigned int uint32_t;
@@ -73,16 +79,17 @@ __global__ void md5_preprocess_batched(uint8_t *pre_processed_msgs, size_t *pre_
 
     // Bounds-checking
     if (idx < BATCH_SIZE) {
-        int n = orig_sizes[idx];
-        int size_in_bits = 8 * n;
-        int pre_processed_size = pre_processed_sizes[idx];
+        size_t n = orig_sizes[idx];
+        uint64_t size_in_bits = 8ULL * n;
+        size_t pre_processed_size = pre_processed_sizes[idx];
 
         // Add 0x80 byte
         pre_processed_msgs[culmn_sizes[idx] + n] = 0x80;
         // Adding the length
-        for (int i = pre_processed_size - 8; i < pre_processed_size; i++) {
-            int offset = i - (pre_processed_size - 8);
-            pre_processed_msgs[culmn_sizes[idx] + (pre_processed_size - 8) + ((pre_processed_size - i) - 1)] = (size_in_bits >> ((7 - offset) * 8)) & 0xff;
+        for (size_t i = pre_processed_size - 8; i < pre_processed_size; i++) {
+            size_t offset = i - (pre_processed_size - 8);
+            pre_processed_msgs[culmn_sizes[idx] + (pre_processed_size - 8) + ((pre_processed_size - i) - 1)] =
+                (size_in_bits >> ((7 - offset) * 8)) & 0xff;
         }
     }
 }
@@ -93,7 +100,7 @@ __global__ void md5_compute_batched(md5_ctx *ctxs, uint8_t *pre_processed_msgs, 
 
     // Bounds-checking
     if (idx < BATCH_SIZE) {
-        int pre_processed_size = pre_processed_sizes[idx];
+        size_t pre_processed_size = pre_processed_sizes[idx];
         // Index using culminative sizes
         uint8_t *pre_processed_msg = pre_processed_msgs + culmn_sizes[idx];
         md5_ctx ctx = ctxs[idx];
@@ -157,7 +164,6 @@ __global__ void md5_compare_ctx_batched(md5_ctx *ctxs, md5_ctx *target_ctx, int 
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
 
     if (idx < BATCH_SIZE) {
-        int start = idx * DIGEST_SIZE;
         md5_ctx ctx = ctxs[idx];
 
         if (ctx.a == target_ctx->a &&
@@ -179,12 +185,12 @@ int md5_target_batched(FfiVector *msgs, md5_ctx *h_target_ctx) {
     size_t *d_orig_sizes;
     size_t h_culmn_sizes[BATCH_SIZE];
     size_t *d_culmn_sizes;
-    md5_ctx *h_ctxs[BATCH_SIZE * sizeof(md5_ctx)];
     md5_ctx *d_ctxs;
     md5_ctx *d_target_ctx;
     int *d_match_idx;
     int h_match_idx = -1;
-    int total_size = 0;
+    size_t total_size = 0;
+    const size_t max_total_size = 128 * 1024 * 1024;
     const int threads_per_block = 32;
     const int blocks_per_grid = CEIL((float)BATCH_SIZE / (float)threads_per_block);
 
@@ -194,11 +200,18 @@ int md5_target_batched(FfiVector *msgs, md5_ctx *h_target_ctx) {
         // Size of the i-th message after pre-processing
         // It is calculated as such because we have to fit in the message (msgs[i].len bytes), the message's length
         // as a 64-bit integer (8 bytes), and the additional 0x80 byte (1 byte)
-        int pre_processed_size = CEIL((float)(msgs[i].len + 8 + 1) / (float)CHUNK_SIZE) * CHUNK_SIZE;
+        size_t padded = msgs[i].len + 8 + 1 + (CHUNK_SIZE - 1);
+        size_t pre_processed_size = (padded / CHUNK_SIZE) * CHUNK_SIZE;
+        if (pre_processed_size == 0 || total_size > SIZE_MAX - pre_processed_size) {
+            return -1;
+        }
         h_pre_processed_sizes[i] = pre_processed_size;
         h_orig_sizes[i] = msgs[i].len;
         h_culmn_sizes[i] = (i == 0 ? 0 : h_culmn_sizes[i - 1] + pre_processed_size);
         total_size += pre_processed_size;
+        if (total_size > max_total_size) {
+            return -1;
+        }
     }
 
     // Allocate enough memory for all of the pre-processed messages
@@ -208,41 +221,130 @@ int md5_target_batched(FfiVector *msgs, md5_ctx *h_target_ctx) {
 
     // Memcpy each message to its corresponding index
     for (int i = 0; i < BATCH_SIZE; i++) {
+        if (h_culmn_sizes[i] + msgs[i].len > total_size) {
+            delete[] h_pre_processed_msgs;
+            return -1;
+        }
         memcpy(h_pre_processed_msgs + h_culmn_sizes[i], msgs[i].data, msgs[i].len);
     }
     // Allocate space for the pre-processed messages on the device
-    cudaMalloc(&d_pre_processed_msgs, total_size);
+    if (cudaMalloc(&d_pre_processed_msgs, total_size) != cudaSuccess) {
+        delete[] h_pre_processed_msgs;
+        return -1;
+    }
     // Array of culminative message sizes
-    cudaMalloc(&d_culmn_sizes, sizeof(size_t) * BATCH_SIZE);
+    if (cudaMalloc(&d_culmn_sizes, sizeof(size_t) * BATCH_SIZE) != cudaSuccess) {
+        cudaFree(d_pre_processed_msgs);
+        delete[] h_pre_processed_msgs;
+        return -1;
+    }
     // Array of pre-processed message sizes
-    cudaMalloc(&d_pre_processed_sizes, sizeof(size_t) * BATCH_SIZE);
+    if (cudaMalloc(&d_pre_processed_sizes, sizeof(size_t) * BATCH_SIZE) != cudaSuccess) {
+        cudaFree(d_culmn_sizes);
+        cudaFree(d_pre_processed_msgs);
+        delete[] h_pre_processed_msgs;
+        return -1;
+    }
     // Array of original message sizes
-    cudaMalloc(&d_orig_sizes, sizeof(size_t) * BATCH_SIZE);
+    if (cudaMalloc(&d_orig_sizes, sizeof(size_t) * BATCH_SIZE) != cudaSuccess) {
+        cudaFree(d_pre_processed_sizes);
+        cudaFree(d_culmn_sizes);
+        cudaFree(d_pre_processed_msgs);
+        delete[] h_pre_processed_msgs;
+        return -1;
+    }
     // Array of MD5 contexts
-    cudaMalloc(&d_ctxs, sizeof(md5_ctx) * BATCH_SIZE);
+    if (cudaMalloc(&d_ctxs, sizeof(md5_ctx) * BATCH_SIZE) != cudaSuccess) {
+        cudaFree(d_orig_sizes);
+        cudaFree(d_pre_processed_sizes);
+        cudaFree(d_culmn_sizes);
+        cudaFree(d_pre_processed_msgs);
+        delete[] h_pre_processed_msgs;
+        return -1;
+    }
     // The target context
-    cudaMalloc(&d_target_ctx, sizeof(md5_ctx));
+    if (cudaMalloc(&d_target_ctx, sizeof(md5_ctx)) != cudaSuccess) {
+        cudaFree(d_ctxs);
+        cudaFree(d_orig_sizes);
+        cudaFree(d_pre_processed_sizes);
+        cudaFree(d_culmn_sizes);
+        cudaFree(d_pre_processed_msgs);
+        delete[] h_pre_processed_msgs;
+        return -1;
+    }
     // The integer threads write a match to (if one is found)
-    cudaMalloc(&d_match_idx, sizeof(int));
+    if (cudaMalloc(&d_match_idx, sizeof(int)) != cudaSuccess) {
+        cudaFree(d_target_ctx);
+        cudaFree(d_ctxs);
+        cudaFree(d_orig_sizes);
+        cudaFree(d_pre_processed_sizes);
+        cudaFree(d_culmn_sizes);
+        cudaFree(d_pre_processed_msgs);
+        delete[] h_pre_processed_msgs;
+        return -1;
+    }
     //  Memcpys to the variables allocated above
-    cudaMemcpy(d_pre_processed_msgs, h_pre_processed_msgs, total_size, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_culmn_sizes, h_culmn_sizes, sizeof(size_t) * BATCH_SIZE, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_pre_processed_sizes, h_pre_processed_sizes, sizeof(size_t) * BATCH_SIZE, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_orig_sizes, h_orig_sizes, sizeof(size_t) * BATCH_SIZE, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_ctxs, &init_ctxs, sizeof(md5_ctx) * BATCH_SIZE, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_target_ctx, h_target_ctx, sizeof(md5_ctx), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_match_idx, &h_match_idx, sizeof(int), cudaMemcpyHostToDevice);
+    if (cudaMemcpy(d_pre_processed_msgs, h_pre_processed_msgs, total_size, cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(d_culmn_sizes, h_culmn_sizes, sizeof(size_t) * BATCH_SIZE, cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(d_pre_processed_sizes, h_pre_processed_sizes, sizeof(size_t) * BATCH_SIZE, cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(d_orig_sizes, h_orig_sizes, sizeof(size_t) * BATCH_SIZE, cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(d_ctxs, &init_ctxs, sizeof(md5_ctx) * BATCH_SIZE, cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(d_target_ctx, h_target_ctx, sizeof(md5_ctx), cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(d_match_idx, &h_match_idx, sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) {
+        cudaFree(d_match_idx);
+        cudaFree(d_target_ctx);
+        cudaFree(d_ctxs);
+        cudaFree(d_orig_sizes);
+        cudaFree(d_pre_processed_sizes);
+        cudaFree(d_culmn_sizes);
+        cudaFree(d_pre_processed_msgs);
+        delete[] h_pre_processed_msgs;
+        return -1;
+    }
 
     // Preprocess the messages
     md5_preprocess_batched<<<blocks_per_grid, threads_per_block>>>(d_pre_processed_msgs, d_pre_processed_sizes, d_orig_sizes, d_culmn_sizes);
-    cudaDeviceSynchronize();
+    if (cudaGetLastError() != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess) {
+        cudaFree(d_match_idx);
+        cudaFree(d_target_ctx);
+        cudaFree(d_ctxs);
+        cudaFree(d_orig_sizes);
+        cudaFree(d_pre_processed_sizes);
+        cudaFree(d_culmn_sizes);
+        cudaFree(d_pre_processed_msgs);
+        delete[] h_pre_processed_msgs;
+        return -1;
+    }
     // Modify the states (the core of the MD5 computation)
     md5_compute_batched<<<blocks_per_grid, threads_per_block>>>(d_ctxs, d_pre_processed_msgs, d_pre_processed_sizes, d_culmn_sizes);
-    cudaDeviceSynchronize();
+    if (cudaGetLastError() != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess) {
+        cudaFree(d_match_idx);
+        cudaFree(d_target_ctx);
+        cudaFree(d_ctxs);
+        cudaFree(d_orig_sizes);
+        cudaFree(d_pre_processed_sizes);
+        cudaFree(d_culmn_sizes);
+        cudaFree(d_pre_processed_msgs);
+        delete[] h_pre_processed_msgs;
+        return -1;
+    }
     // Finalize: pack the contexts into digests
     md5_compare_ctx_batched<<<blocks_per_grid, threads_per_block>>>(d_ctxs, d_target_ctx, d_match_idx);
+    if (cudaGetLastError() != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess) {
+        cudaFree(d_match_idx);
+        cudaFree(d_target_ctx);
+        cudaFree(d_ctxs);
+        cudaFree(d_orig_sizes);
+        cudaFree(d_pre_processed_sizes);
+        cudaFree(d_culmn_sizes);
+        cudaFree(d_pre_processed_msgs);
+        delete[] h_pre_processed_msgs;
+        return -1;
+    }
     // Copy into output match
-    cudaMemcpy(&h_match_idx, d_match_idx, sizeof(int), cudaMemcpyDeviceToHost);
+    if (cudaMemcpy(&h_match_idx, d_match_idx, sizeof(int), cudaMemcpyDeviceToHost) != cudaSuccess) {
+        h_match_idx = -1;
+    }
     // Free memory
     cudaFree(d_culmn_sizes);
     cudaFree(d_pre_processed_msgs);
@@ -250,6 +352,8 @@ int md5_target_batched(FfiVector *msgs, md5_ctx *h_target_ctx) {
     cudaFree(d_orig_sizes);
     cudaFree(d_ctxs);
     cudaFree(d_target_ctx);
+    cudaFree(d_match_idx);
+    delete[] h_pre_processed_msgs;
 
     return h_match_idx;
 }
@@ -287,6 +391,8 @@ extern "C" {
                        (data[14] << 16) +
                        (data[15] << 24);
         
-        return md5_target_batched(msgs->data, target_ctx);
+        int result = md5_target_batched(msgs->data, target_ctx);
+        delete target_ctx;
+        return result;
     }
 }
